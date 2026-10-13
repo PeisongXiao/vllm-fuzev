@@ -48,6 +48,38 @@ def _text_config(**kwargs) -> Qwen4ExpTextConfig:
     return Qwen4ExpTextConfig(**values)
 
 
+@pytest.mark.parametrize("quantization", [None, "exl3"])
+def test_qwen4_exp_packed_lm_head_receives_its_quantization_policy(quantization):
+    from vllm.models.qwen4_exp.nvidia import model as module
+
+    quant = SimpleNamespace(get_name=lambda: quantization) if quantization else None
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=_text_config(), dtype=torch.bfloat16
+        ),
+        quant_config=quant,
+        scheduler_config=SimpleNamespace(),
+        cache_config=SimpleNamespace(mamba_cache_mode="align"),
+    )
+    inner = torch.nn.Identity()
+    inner.layers = []
+    inner.make_empty_intermediate_tensors = lambda *args, **kwargs: None
+    with (
+        patch.object(module, "Qwen4ExpModel", return_value=inner),
+        patch.object(
+            module, "ParallelLMHead", return_value=torch.nn.Identity()
+        ) as head,
+        patch.object(module, "LogitsProcessor"),
+        patch.object(module, "enable_qwen4_exp_low_latency_gemm"),
+        patch.object(module.Qwen4ExpForCausalLM, "set_moe_parameters"),
+    ):
+        module.Qwen4ExpForCausalLM(vllm_config=config, prefix="language_model")
+    assert head.call_args.kwargs["prefix"] == "language_model.lm_head"
+    assert head.call_args.kwargs["quant_config"] is (
+        quant if quantization == "exl3" else None
+    )
+
+
 def test_qwen4_exp_mtp_returns_sample_and_multi_streams() -> None:
     from vllm.models.qwen4_exp.nvidia.mtp import (
         Qwen4ExpMultiTokenPredictor,
@@ -246,3 +278,38 @@ def test_qwen4_exp_model_state_prepares_stable_dummy_ngram_inputs() -> None:
     )
     assert second["query_start_loc"].data_ptr() == query_start_loc_ptr
     assert second["ngram_context"].data_ptr() == ngram_context_ptr
+
+
+@pytest.mark.parametrize(
+    "additional_config",
+    [
+        {"ple_storage": "resident"},
+        {"ple_storage": "mmap"},
+        SimpleNamespace(compute_hash=lambda: "custom"),
+    ],
+)
+def test_ple_storage_resolves_loader_and_graph_boundary(additional_config):
+    from vllm.config import CUDAGraphMode, VllmConfig
+
+    config = SimpleNamespace(
+        additional_config=additional_config,
+        model_config=SimpleNamespace(enforce_eager=False),
+        load_config=SimpleNamespace(safetensors_load_strategy="eager"),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.FULL,
+            splitting_ops=["vllm::unified_attention_with_output"],
+        ),
+    )
+    VllmConfig._resolve_ple_storage(config)
+    VllmConfig._resolve_ple_storage(config)
+    if additional_config == {"ple_storage": "mmap"}:
+        assert config.load_config.safetensors_load_strategy == "lazy"
+        assert config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+        assert config.compilation_config.splitting_ops == [
+            "vllm::unified_attention_with_output",
+            "vllm::qwen4_exp_ple_mmap_lookup_out",
+        ]
+    else:
+        assert config.load_config.safetensors_load_strategy == "eager"
+        assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL
+        assert len(config.compilation_config.splitting_ops) == 1

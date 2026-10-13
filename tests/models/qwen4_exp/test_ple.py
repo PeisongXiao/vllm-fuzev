@@ -8,12 +8,18 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors import safe_open
+from safetensors.torch import save_file
 from torch import nn
 from torch.nn import functional as F
 
 import vllm.model_executor.layers.vocab_parallel_embedding as embedding_module
 import vllm.model_executor.parameter as parameter_module
 import vllm.models.qwen4_exp.nvidia.ngram_embedding as ngram_embedding_module
+from vllm.config import EngramConfig
+from vllm.model_executor.layers.quantization.compressed_tensors import (
+    compressed_tensors,
+)
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMixedPrecisionConfig,
@@ -29,6 +35,7 @@ from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
     Qwen4ExpPLEDeviceEmbedding,
     Qwen4ExpPLEEmbeddingMethod,
     Qwen4ExpPLEFp8EmbeddingMethod,
+    Qwen4ExpPLEMmapEmbedding,
     Qwen4ExpPLEPinnedHostEmbedding,
     Qwen4ExpPLEUnquantizedEmbeddingMethod,
 )
@@ -43,9 +50,10 @@ def _mock_etp_group(
     monkeypatch: pytest.MonkeyPatch,
     world_size: int = 1,
     all_reduce=lambda tensor: tensor,
+    rank: int = 0,
 ) -> None:
     group = SimpleNamespace(
-        rank_in_group=0,
+        rank_in_group=rank,
         world_size=world_size,
         all_reduce=all_reduce,
     )
@@ -298,6 +306,194 @@ def test_ple_fp8_embedding_rejects_missing_global_scale(monkeypatch) -> None:
         layer.quant_method.process_weights_after_loading(layer)
 
 
+def _mock_ple_groups(monkeypatch, tp_size=1, rank=0):
+    _mock_etp_group(monkeypatch, world_size=tp_size, rank=rank)
+    for module in (embedding_module, parameter_module):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: rank)
+        monkeypatch.setattr(
+            module, "get_tensor_model_parallel_world_size", lambda: tp_size
+        )
+
+
+def _make_mmap_layer(
+    monkeypatch,
+    dtype=torch.bfloat16,
+    *,
+    embedding_dim=2,
+    topology=(1, 0),
+    **config_overrides,
+):
+    _mock_ple_groups(monkeypatch, *topology)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(enforce_eager=True),
+        load_config=SimpleNamespace(safetensors_load_strategy="lazy"),
+    )
+    for name, value in config_overrides.items():
+        setattr(config, name, value)
+    monkeypatch.setattr(
+        ngram_embedding_module, "get_current_vllm_config", lambda: config
+    )
+    method = (
+        Qwen4ExpPLEFp8EmbeddingMethod()
+        if dtype == torch.float8_e4m3fn
+        else Qwen4ExpPLEUnquantizedEmbeddingMethod()
+    )
+    return Qwen4ExpPLEMmapEmbedding(
+        8,
+        embedding_dim,
+        params_dtype=dtype,
+        padding_size=1,
+        prefix="test.mapped_ple",
+        embedding_method=method,
+    )
+
+
+@pytest.mark.parametrize(
+    "additional_config",
+    [{"ple_storage": "mmap"}, SimpleNamespace(compute_hash=lambda: "custom")],
+)
+def test_ngram_storage_selects_embedding_and_loads_rows(monkeypatch, additional_config):
+    monkeypatch.delenv("VLLM_PLE_CPU_OFFLOAD", raising=False)
+    config = SimpleNamespace(
+        additional_config=additional_config,
+        engram_config=EngramConfig(),
+        model_config=SimpleNamespace(enforce_eager=True),
+    )
+    _mock_ple_groups(monkeypatch)
+    monkeypatch.setattr(
+        ngram_embedding_module, "get_current_vllm_config", lambda: config
+    )
+    if not isinstance(additional_config, dict):
+        config.engram_config = None
+    module = Qwen4ExpNGramEmbedding(
+        SimpleNamespace(
+            ngram_size=2,
+            heads_per_ngram=1,
+            eos_token_id=0,
+            vocab_size=8,
+            ngram_vocab_size_base=7,
+            make_ngram_vocab_size_divisible_by=1,
+        ),
+        embedding_dim=2,
+        ple_dense_layer_id=0,
+        max_total_tokens=8,
+        data_parallel_rank=0,
+        prefix="test.ple",
+        params_dtype=torch.bfloat16,
+    )
+    layer = module.ngram_embedding
+    weight = torch.arange(layer.org_vocab_size * 2).reshape(-1, 2).bfloat16()
+    layer.weight.weight_loader(layer.weight, weight)
+    layer.quant_method.process_weights_after_loading(layer)
+    ids = torch.tensor([[0], [layer.org_vocab_size - 1], [0]])
+    torch.testing.assert_close(layer(ids), weight[ids])
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_mmap_loads_checkpoint_across_separate_weight_groups(monkeypatch, dtype):
+    module = _make_ngram_embedding_for_load_test()
+    layer = _make_mmap_layer(monkeypatch, dtype)
+    module.ngram_embedding = layer
+    weight = torch.arange(16).reshape(8, 2).to(dtype)
+    module.load_weights([("ngram_embedding.shard_1.weight", weight[4:])])
+    module.load_weights([("ngram_embedding.shard_0.weight", weight[:4])])
+    if dtype == torch.float8_e4m3fn:
+        layer.weight_scale.data.fill_(1.0)
+    layer.quant_method.process_weights_after_loading(layer)
+    ids = torch.tensor([[0, 7, 3, 4]])
+    torch.testing.assert_close(layer(ids).float(), weight.float()[ids])
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("topology", [(1, 0), (2, 0), (2, 1)])
+def test_mmap_ple_retains_file_views_and_only_gathers_requested_rows(
+    monkeypatch, tmp_path, dtype, topology
+):
+    layer = _make_mmap_layer(monkeypatch, dtype, topology=topology)
+    weight = torch.arange(16).reshape(8, 2).to(dtype)
+    path = tmp_path / "table.safetensors"
+    save_file({"first": weight[:3], "middle": weight[3:5], "last": weight[5:]}, path)
+    with safe_open(path, framework="pt") as checkpoint:
+        first = checkpoint.get_tensor("first")
+        middle = checkpoint.get_tensor("middle")
+        last = checkpoint.get_tensor("last")
+        layer.weight.weight_loader(layer.weight, last, checkpoint_start=5)
+        layer.weight.weight_loader(layer.weight, first, checkpoint_start=0)
+        layer.weight.weight_loader(layer.weight, middle, checkpoint_start=3)
+    assert layer.weight.shape == (1, 2)
+    layer.finalize_mappings()
+    ids = torch.tensor([[7, 0, 7], [3, 4, 1]])
+    result = layer(ids)
+    torch.testing.assert_close(result.float(), weight.float()[ids])
+    assert result.shape == (2, 3, 2)
+    if dtype == torch.float8_e4m3fn:
+        layer.weight_scale.data.fill_(0.25)
+        layer.quant_method.process_weights_after_loading(layer)
+        torch.testing.assert_close(
+            layer.dequantize(result, torch.bfloat16),
+            (weight.float()[ids] * 0.25).bfloat16(),
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_mmap_piecewise_boundary_preserves_exact_file_bytes(
+    monkeypatch, tmp_path, dtype
+):
+    from vllm.platforms import current_platform
+
+    device = current_platform.device_type
+    if not device or (device == "cuda" and not torch.cuda.is_available()):
+        pytest.skip("The registered CUDA custom op requires a CUDA device")
+    compilation = SimpleNamespace(
+        cudagraph_mode="PIECEWISE",
+        splitting_ops=[ngram_embedding_module.PLE_MMAP_LOOKUP_OP],
+        static_forward_context={},
+    )
+    layer = _make_mmap_layer(
+        monkeypatch,
+        dtype,
+        model_config=SimpleNamespace(enforce_eager=False),
+        compilation_config=compilation,
+    )
+    monkeypatch.setattr(
+        ngram_embedding_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(no_compile_layers=compilation.static_forward_context),
+    )
+    weight = torch.arange(16).reshape(8, 2).to(dtype)
+    path = tmp_path / "table.safetensors"
+    save_file({"weight": weight}, path)
+    with safe_open(path, framework="pt") as checkpoint:
+        layer.weight.weight_loader(layer.weight, checkpoint.get_tensor("weight"))
+    layer.finalize_mappings()
+    ids = torch.tensor([[7, 0, 7], [3, 4, 1]], device=device)
+    output = layer(ids)
+    assert layer.weight.shape == (1, 2)
+    expected = weight.view(torch.uint8)[ids.cpu()]
+    torch.testing.assert_close(output.cpu().view(torch.uint8), expected, rtol=0, atol=0)
+    compiled = torch.compile(layer, backend="eager", fullgraph=True, dynamic=True)
+    torch.testing.assert_close(
+        compiled(ids).cpu().view(torch.uint8), expected, rtol=0, atol=0
+    )
+    # The fake out-buffer operation must not touch mappings or read ID values.
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        fake_ids = torch.empty(2, 3, dtype=torch.long, device=device)
+        fake_output = torch.empty(2, 3, 2, dtype=dtype, device=device)
+        torch.ops.vllm.qwen4_exp_ple_mmap_lookup_out(
+            fake_ids, fake_output, "not-a-real-layer"
+        )
+
+
+def test_compressed_tensors_mixed_checkpoint_keeps_raw_ple():
+    config = compressed_tensors.CompressedTensorsConfig.from_config(
+        {"format": "mixed-precision", "config_groups": {}, "ignore": []}
+    )
+    method = Qwen4ExpPLEEmbeddingMethod.from_quant_config(config, "operator.ple")
+    assert isinstance(method, Qwen4ExpPLEUnquantizedEmbeddingMethod)
+
+
 @pytest.mark.parametrize("requires_device_loading", [False, True])
 @pytest.mark.parametrize("load_scale", [False, True])
 def test_pinned_ple_post_load_validates_scale_without_staging(
@@ -449,6 +645,16 @@ def test_ple_embedding_dtype_overrides_modelopt_exclusion() -> None:
             quant_config,
             prefix,
             "float8_e4m3fn",
+        ),
+        Qwen4ExpPLEFp8EmbeddingMethod,
+    )
+
+
+def test_optional_ple_factory_falls_through_without_claiming_the_table() -> None:
+    quant_config = SimpleNamespace(get_ple_embedding_method=lambda *_: None)
+    assert isinstance(
+        Qwen4ExpPLEEmbeddingMethod.from_quant_config(
+            quant_config, "model.ngram_embedding", "float8_e4m3fn"
         ),
         Qwen4ExpPLEFp8EmbeddingMethod,
     )
@@ -1715,3 +1921,39 @@ def test_fused_gate_correctness(num_tokens: int, strided_kv: bool) -> None:
     expected_normed = grouped_norm(expected_gated, norm_conv)
     assert torch.equal(gated, expected_gated)
     torch.testing.assert_close(normed, expected_normed, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs")
+def test_mmap_graph_replay_consumes_current_producer_ids(monkeypatch, tmp_path):
+    import vllm.compilation.breakable_cudagraph as breakable
+
+    layer = _make_mmap_layer(monkeypatch)
+    weight = torch.arange(16).reshape(8, 2).bfloat16()
+    path = tmp_path / "table.safetensors"
+    save_file({"weight": weight}, path)
+    with safe_open(path, framework="pt") as checkpoint:
+        layer.weight.weight_loader(layer.weight, checkpoint.get_tensor("weight"))
+    layer.finalize_mappings()
+    monkeypatch.setattr(
+        ngram_embedding_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(no_compile_layers={"table": layer}),
+    )
+    lookup = ngram_embedding_module._ple_mmap_lookup_out
+    inputs = torch.tensor([0, 3, 6], device="cuda")
+    output = torch.empty(3, 2, dtype=torch.bfloat16, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        lookup(inputs + 1, output, "table")
+        torch.cuda.synchronize()
+        capture = breakable.BreakableCUDAGraphCapture()
+        with capture:
+            ids = inputs + 1
+            lookup(ids, output, "table")
+            result = output.clone()
+        for values in ([2, 0, 5], [6, 1, 3]):
+            inputs.copy_(torch.tensor(values, device="cuda"))
+            capture.replay()
+            torch.testing.assert_close(result.cpu(), weight[torch.tensor(values) + 1])
+    torch.cuda.current_stream().wait_stream(stream)

@@ -63,7 +63,7 @@ def _weak_ref_capture_arg(arg: Any) -> Any:
     return weak_ref_tensor(arg)
 
 
-def eager_break_during_capture(fn: F) -> F:
+def eager_break_during_capture(fn: F | None = None, *, materialize: bool = False):
     """Decorator that turns a custom-op Python kernel into a "break point"
     for the breakable cudagraph capture.
 
@@ -94,7 +94,10 @@ def eager_break_during_capture(fn: F) -> F:
         def unified_attention_with_output(...):
             ...
     """
-    if not is_breakable_cudagraph_enabled():
+    if fn is None:
+        return functools.partial(eager_break_during_capture, materialize=materialize)
+    # Materialized host lookups may be imported before config enables capture.
+    if not materialize and not is_breakable_cudagraph_enabled():
         return fn
 
     @functools.wraps(fn)
@@ -114,7 +117,9 @@ def eager_break_during_capture(fn: F) -> F:
         # weak_ref is safe to deref on replay.
         weak_args = tuple(_weak_ref_capture_arg(a) for a in args)
         weak_kwargs = {k: _weak_ref_capture_arg(v) for k, v in kwargs.items()}
-        return capture.add_eager(lambda: fn(*weak_args, **weak_kwargs))
+        return capture.add_eager(
+            lambda: fn(*weak_args, **weak_kwargs), materialize=materialize
+        )
 
     return wrapper  # type: ignore[return-value]
 
@@ -188,13 +193,14 @@ class BreakableCUDAGraphCapture:
         if not self._capturing:
             return
         assert self._current_graph is not None
-        self._current_graph.capture_end()
-        self.segments.append(self._current_graph.replay)
+        graph = self._current_graph
+        graph.capture_end()
+        self.segments.append(graph.replay)
         self._num_graphs += 1
         self._current_graph = None
         self._capturing = False
 
-    def add_eager(self, fn: Callable[[], Any]) -> Any:
+    def add_eager(self, fn: Callable[[], Any], *, materialize: bool = False) -> Any:
         """End the current capture segment, run ``fn`` eagerly on the
         capture stream, record ``fn`` for replay, and start a new segment.
 
@@ -202,7 +208,12 @@ class BreakableCUDAGraphCapture:
         Replay does not return values; callers should propagate any
         downstream dependencies via static output buffers.
         """
+        graph = self._current_graph if materialize else None
         self._end_segment()
+        if graph is not None:
+            # Capture only records kernels. Materialize this segment's outputs
+            # before an eager consumer, without re-running earlier stateful ops.
+            graph.replay()
         result = fn()
         self.segments.append(fn)
         self._num_eager_breaks += 1

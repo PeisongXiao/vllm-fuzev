@@ -1,4 +1,68 @@
 <!-- markdownlint-disable MD001 MD041 -->
+## vLLM FuZev
+
+Release `0.30.0+fuzev.v1.0` adds optional decision-feature readout to vLLM
+`0.30.0` for [FuZev](https://github.com/PeisongXiao/fuzev). Generation and
+decisions share the loaded model, scheduler and prefix cache.
+The separate [fuzev-vllm-plugin](https://github.com/PeisongXiao/fuzev-vllm-plugin)
+serves the decision API and loads the
+[decision head](https://huggingface.co/peisongxiao/Qwen3.8-Flash-Next-FuZev) with
+[fuzev-runtime](https://github.com/PeisongXiao/fuzev-runtime).
+
+**Contents**
+
+- [Install From a Source Zip](#install-from-a-source-zip)
+- [Limitations](#limitations)
+- [Upstream vLLM](#upstream-vllm)
+
+### Install From a Source Zip
+
+Create one environment and install Torch with the canonical
+[FuZev install procedure](https://github.com/PeisongXiao/fuzev/blob/main/docs/install.md#create-an-environment).
+In that active environment, the [vLLM step](https://github.com/PeisongXiao/fuzev/blob/main/docs/install.md#vllm)
+combines the stock **0.30.0** wheel's compiled extensions with this fork's
+Python code. Run from the extracted fork root:
+
+```bash
+python -m pip download --no-deps --only-binary=:all: \
+  --dest wheels "vllm==0.30.0"
+export VLLM_USE_PRECOMPILED=1
+export VLLM_PRECOMPILED_WHEEL_LOCATION="$(python -c \
+  'from pathlib import Path; print(next(Path("wheels").glob("vllm-0.30.0-*.whl")).resolve())')"
+python -m pip install .
+```
+
+- The wheel location selects the matching release binaries. Choose a wheel
+  compatible with your platform and CUDA/PyTorch runtime.
+- Before engine startup, install the matching
+  [prebuilt FlashInfer cache](https://github.com/PeisongXiao/fuzev/blob/main/docs/install.md#vllm)
+  and keep `MAX_JOBS` set, as in that guide.
+- This fork changes Python and Triton code. Its C/CUDA extension sources match
+  vLLM 0.30.0.
+- Tested on NVIDIA GB10 (Python 3.12, PyTorch 2.13.0+cu130).
+
+Install the decision plugin separately. Its model selection, head bundle and
+API settings are independent of the engine installation.
+[Engine integration](docs/design/fuzev.md) covers the readout interface;
+the [implementation map](docs/fuzev-fork.md) lists the changed engine components.
+
+### Limitations
+
+- NVFP4 MTP is supported; EXL3 with MTP is unsupported.
+- The selected head bundle sets the option count. The feature width is the
+  loaded model's hidden size.
+- A small matched comparison of generation with and without the head loaded is
+  inconclusive ([integration](https://github.com/PeisongXiao/fuzev/blob/main/docs/integration.md#loaded-but-unused-head)).
+- Fork overhead against stock vLLM 0.30.0 is unmeasured.
+- Readout and storage: see the [design limitations](docs/design/fuzev.md#limitations).
+
+---
+
+## Upstream vLLM
+
+The upstream overview below describes stock vLLM. Its package installation
+commands install stock vLLM, which lacks the FuZev hooks.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">

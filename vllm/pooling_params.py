@@ -11,6 +11,7 @@ from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind
 from vllm.tasks import PoolingTask, check_removed_pooling_task
+from vllm.v1.fuzev import FEATURE_TASK
 
 logger = init_logger(__name__)
 
@@ -88,6 +89,40 @@ class PoolingParams(
         return deepcopy(self)
 
     def verify(self, model_config: ModelConfig) -> None:
+        if self.task == FEATURE_TASK:
+            if (
+                any(
+                    getattr(self, name) is not None
+                    for name in (
+                        *self.all_parameters,
+                        "step_tag_id",
+                        "returned_token_ids",
+                        "late_interaction_params",
+                    )
+                )
+                or self.requires_token_ids
+            ):
+                raise VLLMValidationError("FuZev readout accepts no pooling options")
+            options = self.extra_kwargs or {}
+            if set(options) - {"baseline_token_ids"}:
+                raise VLLMValidationError(
+                    "FuZev readout accepts only baseline_token_ids in extra_kwargs"
+                )
+            labels = options.get("baseline_token_ids")
+            if labels is not None and (
+                not isinstance(labels, list)
+                or any(
+                    type(token) is not int
+                    or not 0 <= token < model_config.get_vocab_size()
+                    for token in labels
+                )
+            ):
+                raise VLLMValidationError(
+                    "baseline_token_ids must be in-vocabulary integer token IDs"
+                )
+            if self.skip_reading_prefix_cache is None:
+                self.skip_reading_prefix_cache = False
+            return
         # plugin task uses io_processor.parse_data to verify inputs,
         # skipping PoolingParams verify
         if self.task == "plugin":

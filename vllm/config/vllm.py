@@ -1874,6 +1874,8 @@ class VllmConfig:
             data_parallel_size=effective_dp_size,
         )
 
+        self._resolve_ple_storage()
+
         if self.compilation_config.pass_config.enable_sp:
             # With pipeline parallelism, native rms norm tracing errors due to
             # incorrect residual shape.
@@ -2108,6 +2110,27 @@ class VllmConfig:
             for size in possible_sizes
             if size % self.parallel_config.tensor_parallel_size == 0
         ]
+
+    def _resolve_ple_storage(self) -> None:
+        options = (
+            self.additional_config if isinstance(self.additional_config, dict) else {}
+        )
+        if options.get("ple_storage") != "mmap":
+            return
+        self.load_config.safetensors_load_strategy = "lazy"
+        if self.model_config is None or self.model_config.enforce_eager:
+            return
+        compilation = self.compilation_config
+        if compilation.cudagraph_mode.has_full_cudagraphs():
+            logger.warning_once(
+                "Mmap PLE uses PIECEWISE CUDA graphs for host row lookup."
+            )
+            compilation.cudagraph_mode = CUDAGraphMode.PIECEWISE
+        lookup_op = "vllm::qwen4_exp_ple_mmap_lookup_out"
+        splitting_ops = list(compilation.splitting_ops or [])
+        if lookup_op not in splitting_ops:
+            splitting_ops.append(lookup_op)
+        compilation.splitting_ops = splitting_ops
 
     def _set_max_num_scheduled_tokens(self):
         """

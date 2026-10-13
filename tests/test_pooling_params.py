@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -31,6 +32,36 @@ step_pooling_parameters = ["step_tag_id", "returned_token_ids"]
 @dataclass()
 class MockModelConfig:
     pooler_config: PoolerConfig
+
+
+def test_fuzev_readout_keeps_raw_features_and_reads_prefix_cache():
+    params = PoolingParams(task="fuzev_features")
+    params.verify(SimpleNamespace(pooler_config=None))
+    assert params.skip_reading_prefix_cache is False
+    for name in ("dimensions", "use_activation", "step_tag_id", "requires_token_ids"):
+        with pytest.raises(VLLMValidationError, match="accepts no pooling options"):
+            PoolingParams(task="fuzev_features", **{name: 1}).verify(
+                SimpleNamespace(pooler_config=None)
+            )
+
+
+def test_fuzev_baseline_labels_validate_token_type_and_vocabulary():
+    model = SimpleNamespace(get_vocab_size=lambda: 100)
+    for labels in (list(range(20)), [10], [10, 10], []):
+        PoolingParams(
+            task="fuzev_features", extra_kwargs={"baseline_token_ids": labels}
+        ).verify(model)
+    for labels in ([100, 20], [-1, 20], [True, 20], "AB"):
+        with pytest.raises(
+            VLLMValidationError, match="in-vocabulary integer token IDs"
+        ):
+            PoolingParams(
+                task="fuzev_features", extra_kwargs={"baseline_token_ids": labels}
+            ).verify(model)
+    with pytest.raises(VLLMValidationError, match="only baseline_token_ids"):
+        PoolingParams(task="fuzev_features", extra_kwargs={"labels": [10]}).verify(
+            model
+        )
 
 
 @pytest.mark.parametrize(

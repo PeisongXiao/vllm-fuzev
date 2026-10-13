@@ -1,0 +1,13 @@
+FuZev additions
+Copyright 2026 Peisong Xiao
+
+This distribution includes vLLM, Copyright contributors to the vLLM project,
+licensed under the Apache License, Version 2.0. Upstream copyright notices
+and third-party license files remain with their corresponding sources.
+
+Qwen3.8-Flash-Next backbone: Qwen team, Qwen Community License 1.0.
+https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE
+EXL3 quantization: turboderp; backbone Qwen Community License 1.0 terms apply.
+https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3
+Training and evaluation dataset credits and separate license terms are listed
+in the FuZev attribution file: https://github.com/PeisongXiao/fuzev/blob/main/NOTICE

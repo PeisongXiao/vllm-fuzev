@@ -14,6 +14,7 @@ PoolingTask = Literal[
     "token_classify",
     "plugin",
     "embed&token_classify",
+    "fuzev_features",
 ]
 POOLING_TASKS: tuple[PoolingTask, ...] = get_args(PoolingTask)
 

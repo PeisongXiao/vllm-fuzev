@@ -98,12 +98,12 @@ class SpecDecodeBaseProposer:
         self.hidden_size = self.draft_model_config.get_hidden_size()
         self.inputs_embeds_size = self.draft_model_config.get_inputs_embeds_size()
 
-        # DeepSeek V4 MTP consumes the target's pre-hc_head residual stream,
-        # shape (T, hc_mult * hidden_size). Expand the hidden_states buffer
-        # so target_hidden_states fits; detect DeepseekV4 via draft hf_config.
+        # Hyper-connection MTP consumes the pre-collapse multi-stream state.
+        # Qwen's draft config explicitly supplies the stream multiplier too.
         draft_hf_config = self.draft_model_config.hf_config
-        if hasattr(draft_hf_config, "compress_ratios") and hasattr(
-            draft_hf_config, "hc_mult"
+        if hasattr(draft_hf_config, "hc_mult") and (
+            hasattr(draft_hf_config, "compress_ratios")
+            or getattr(draft_hf_config, "model_type", None) == "qwen4_exp_mtp"
         ):
             self.hidden_size = self.hidden_size * draft_hf_config.hc_mult
 
@@ -1373,6 +1373,7 @@ class SpecDecodeBaseProposer:
                 "Qwen3_5MoeForConditionalGeneration",
                 "Qwen3VLForConditionalGeneration",
                 "Qwen3VLMoeForConditionalGeneration",
+                "Qwen4ExpForConditionalGeneration",
                 "Gemma4ForConditionalGeneration",
                 "Gemma4UnifiedForConditionalGeneration",
                 "Step3p7ForConditionalGeneration",

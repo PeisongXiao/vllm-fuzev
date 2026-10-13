@@ -30,6 +30,7 @@ from vllm.multimodal.inputs import (
     MultiModalKwargsItem,
     PlaceholderRange,
 )
+from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
@@ -39,6 +40,7 @@ from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import FinishReason
+from vllm.v1.fuzev import select_feature_batch
 from vllm.v1.hisparse.coordinator import get_hisparse_coordinator
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -61,6 +63,336 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.fixture
+def fuzev_model(tmp_path, monkeypatch):
+    from transformers import OPTConfig
+
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    OPTConfig(
+        hidden_size=64,
+        num_attention_heads=4,
+        num_hidden_layers=1,
+        ffn_dim=128,
+        vocab_size=128,
+        max_position_embeddings=256,
+        architectures=["OPTForCausalLM"],
+    ).save_pretrained(tmp_path)
+    return str(tmp_path)
+
+
+def test_fuzev_task_lanes_alternate_without_starving_a_full_generation_lane():
+    generate = SimpleNamespace(pooling_params=None)
+    feature = SimpleNamespace(pooling_params=PoolingParams(task="fuzev_features"))
+    assert select_feature_batch([generate], [feature], [], 1, False)
+    assert not select_feature_batch([generate], [feature], [], 1, True)
+    assert not select_feature_batch([generate], [feature], [], 0, False)
+    assert select_feature_batch([], [], [feature], 1, False)
+
+
+def test_fuzev_aborted_waiting_readout_restores_generation_only_scheduling(
+    monkeypatch, fuzev_model
+):
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    scheduler = create_scheduler(
+        model=fuzev_model,
+        additional_config={"fuzev": {"enabled": True}},
+        skip_tokenizer_init=True,
+        max_model_len=64,
+        max_num_batched_tokens=64,
+        scheduling_policy="priority",
+    )
+    feature = Request("feature", [1, 2], None, PoolingParams(task="fuzev_features"))
+    generation = create_requests(num_requests=1, num_tokens=16)[0]
+    scheduler.add_request(feature)
+    scheduler.add_request(generation)
+    scheduler.finish_requests(feature.request_id, RequestStatus.FINISHED_ABORTED)
+    step = scheduler.schedule()
+    assert set(step.num_scheduled_tokens) == {generation.request_id}
+    assert not step.fuzev_readout_lane
+
+
+def test_fuzev_scheduler_returns_only_one_task_per_step_and_finishes_readouts(
+    monkeypatch,
+    fuzev_model,
+):
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    scheduler = create_scheduler(
+        model=fuzev_model,
+        additional_config={"fuzev": {"enabled": True}},
+        skip_tokenizer_init=True,
+        max_num_seqs=4,
+        max_model_len=64,
+        max_num_batched_tokens=64,
+    )
+    generate = create_requests(num_requests=1, num_tokens=16)[0]
+    feature = Request(
+        "features", list(range(16)), None, PoolingParams(task="fuzev_features")
+    )
+    scheduler.add_request(generate)
+    scheduler.add_request(feature)
+    first = scheduler.schedule()
+    assert set(first.num_scheduled_tokens) == {generate.request_id}
+    scheduler.update_from_output(
+        first,
+        ModelRunnerOutput(
+            req_ids=[generate.request_id],
+            req_id_to_index={generate.request_id: 0},
+            sampled_token_ids=[[100]],
+        ),
+    )
+    second = scheduler.schedule()
+    assert set(second.num_scheduled_tokens) == {feature.request_id}
+    result = scheduler.update_from_output(
+        second,
+        ModelRunnerOutput(
+            req_ids=[feature.request_id],
+            req_id_to_index={feature.request_id: 0},
+            pooler_output=[torch.ones(64)],
+        ),
+    )
+    assert feature.is_finished()
+    assert result[0].outputs[0].pooling_output.shape == (64,)
+    assert set(scheduler.schedule().num_scheduled_tokens) == {generate.request_id}
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [None, 3])
+def test_fuzev_readout_consumes_full_window_without_reserving_a_sample(
+    monkeypatch,
+    fuzev_model,
+    num_speculative_tokens,
+):
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    scheduler = create_scheduler(
+        model=fuzev_model,
+        additional_config={"fuzev": {"enabled": True}},
+        skip_tokenizer_init=True,
+        max_num_seqs=4,
+        max_model_len=64,
+        max_num_batched_tokens=8,
+        num_speculative_tokens=num_speculative_tokens,
+    )
+    feature = Request(
+        "full-window", list(range(64)), None, PoolingParams(task="fuzev_features")
+    )
+    scheduler.add_request(feature)
+    chunks = []
+    for index in range(8):
+        step = scheduler.schedule()
+        assert step.num_spec_tokens_to_schedule == 0
+        assert not step.scheduled_spec_decode_tokens
+        chunks.append(step.num_scheduled_tokens[feature.request_id])
+        scheduler.update_from_output(
+            step,
+            ModelRunnerOutput(
+                req_ids=[feature.request_id],
+                req_id_to_index={feature.request_id: 0},
+                pooler_output=[torch.ones(64) if index == 7 else None],
+            ),
+        )
+    assert chunks == [8] * 8
+    assert feature.num_computed_tokens == 64
+    assert feature.is_finished()
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_fuzev_cached_tail_excludes_drafts_but_generation_keeps_speculation(
+    monkeypatch,
+    fuzev_model,
+    dynamic,
+):
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    scheduler = create_scheduler(
+        model=fuzev_model,
+        additional_config={"fuzev": {"enabled": True}},
+        skip_tokenizer_init=True,
+        max_num_seqs=4,
+        max_model_len=64,
+        max_num_batched_tokens=64,
+        enable_prefix_caching=True,
+        num_speculative_tokens=3,
+    )
+    if dynamic:
+        scheduler.dynamic_sd_lookup = [0, 2, 2, 2, 2]
+    generate = create_requests(num_requests=1, num_tokens=16, same_prompt=True)[0]
+    scheduler.add_request(generate)
+    first = scheduler.schedule()
+    scheduler.update_from_output(
+        first,
+        ModelRunnerOutput(
+            req_ids=[generate.request_id],
+            req_id_to_index={generate.request_id: 0},
+            sampled_token_ids=[[100]],
+        ),
+    )
+    feature = Request(
+        "cached-tail",
+        generate.prompt_token_ids + [100],
+        None,
+        PoolingParams(task="fuzev_features"),
+        block_hasher=get_request_block_hasher(16, sha256),
+    )
+    scheduler.add_request(feature)
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([generate.request_id, feature.request_id], [[101, 102], [99]])
+    )
+    assert feature.spec_token_ids == []
+    handoff = SimpleNamespace(
+        scheduled_spec_decode_tokens={
+            generate.request_id: [-1, -1],
+            feature.request_id: [-1],
+        }
+    )
+    scheduler.update_draft_token_ids_in_output(
+        DraftTokenIds([generate.request_id, feature.request_id], [[101, 102], [99]]),
+        handoff,
+    )
+    assert handoff.scheduled_spec_decode_tokens == {generate.request_id: [101, 102]}
+    allocation = Mock(wraps=scheduler.kv_cache_manager.allocate_slots)
+    monkeypatch.setattr(scheduler.kv_cache_manager, "allocate_slots", allocation)
+    step = scheduler.schedule()
+    assert step.num_scheduled_tokens == {feature.request_id: 1}
+    assert step.num_spec_tokens_to_schedule == 0
+    assert not step.scheduled_spec_decode_tokens
+    assert allocation.call_args.kwargs["num_lookahead_tokens"] == 0
+    scheduler.update_from_output(
+        step,
+        ModelRunnerOutput(
+            req_ids=[feature.request_id],
+            req_id_to_index={feature.request_id: 0},
+            pooler_output=[torch.ones(64)],
+        ),
+    )
+    step = scheduler.schedule()
+    assert step.num_scheduled_tokens == {generate.request_id: 3}
+    assert step.scheduled_spec_decode_tokens == {generate.request_id: [101, 102]}
+    assert step.num_spec_tokens_to_schedule == (2 if dynamic else 3)
+    assert (
+        allocation.call_args.kwargs["num_lookahead_tokens"]
+        == scheduler.num_lookahead_tokens
+    )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_fuzev_generation_only_retains_speculative_cached_tail(
+    monkeypatch,
+    fuzev_model,
+    enabled,
+):
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    scheduler = create_scheduler(
+        model=fuzev_model,
+        additional_config={"fuzev": {"enabled": enabled}},
+        skip_tokenizer_init=True,
+        max_model_len=64,
+        max_num_batched_tokens=64,
+        enable_prefix_caching=True,
+        num_speculative_tokens=3,
+    )
+    original, repeated = create_requests(
+        num_requests=2,
+        num_tokens=17,
+        same_prompt=True,
+    )
+    scheduler.add_request(original)
+    first = scheduler.schedule()
+    scheduler.update_from_output(
+        first,
+        ModelRunnerOutput(
+            req_ids=[original.request_id],
+            req_id_to_index={original.request_id: 0},
+            sampled_token_ids=[[100]],
+        ),
+    )
+    scheduler.finish_requests([original.request_id], RequestStatus.FINISHED_ABORTED)
+    scheduler.add_request(repeated)
+    step = scheduler.schedule()
+    assert step.num_scheduled_tokens == {repeated.request_id: 4}
+    assert step.scheduled_spec_decode_tokens == {repeated.request_id: [-1] * 3}
+    assert step.num_spec_tokens_to_schedule == 3
+
+
+def test_fuzev_target_only_chunks_do_not_publish_unwritten_draft_cache(
+    monkeypatch,
+    fuzev_model,
+):
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    scheduler = create_scheduler(
+        model=fuzev_model,
+        additional_config={"fuzev": {"enabled": True}},
+        skip_tokenizer_init=True,
+        max_model_len=64,
+        max_num_batched_tokens=16,
+        enable_prefix_caching=True,
+        num_speculative_tokens=3,
+    )
+    # Model-free fixture: enable the real MTP capability predicate after config
+    # construction, without loading a target or drafter. Cache entries encompass
+    # both models; the scheduler cannot publish one model's incomplete entry.
+    scheduler.vllm_config.speculative_config.method = "mtp"
+    scheduler.num_lookahead_tokens = 3
+    scheduler.num_prefill_lookahead = 3
+    generate = create_requests(num_requests=1, num_tokens=16)[0]
+    feature = Request(
+        "target-only",
+        list(range(34)),
+        None,
+        PoolingParams(task="fuzev_features"),
+        block_hasher=get_request_block_hasher(16, sha256),
+    )
+    scheduler.add_request(feature)
+    coordinator = scheduler.kv_cache_manager.coordinator
+    publish = Mock(wraps=coordinator.cache_blocks)
+    monkeypatch.setattr(coordinator, "cache_blocks", publish)
+    allocation = Mock(wraps=scheduler.kv_cache_manager.allocate_slots)
+    monkeypatch.setattr(scheduler.kv_cache_manager, "allocate_slots", allocation)
+    for size in [16, 16, 2]:
+        step = scheduler.schedule()
+        assert step.num_scheduled_tokens == {feature.request_id: size}
+        assert step.num_spec_tokens_to_schedule == 0
+        assert not step.scheduled_spec_decode_tokens
+        assert allocation.call_args.kwargs["delay_cache_blocks"]
+        assert allocation.call_args.kwargs["num_lookahead_tokens"] == 0
+        scheduler.update_from_output(
+            step,
+            ModelRunnerOutput(
+                req_ids=[feature.request_id],
+                req_id_to_index={feature.request_id: 0},
+                pooler_output=[torch.ones(64) if size == 2 else None],
+            ),
+        )
+    publish.assert_not_called()
+    assert feature.is_finished()
+    assert scheduler.kv_cache_manager.get_computed_blocks(feature)[1] == 0
+
+    scheduler.add_request(generate)
+    step = scheduler.schedule()
+    assert not allocation.call_args.kwargs["delay_cache_blocks"]
+    assert allocation.call_args.kwargs["num_lookahead_tokens"] == 3
+    assert step.num_spec_tokens_to_schedule == 3
+    publish.assert_called_once()
+    # Published generation entries remain usable by readouts under MTP.
+    cached = Request(
+        "valid-hit",
+        generate.prompt_token_ids + [1],
+        None,
+        PoolingParams(task="fuzev_features"),
+        block_hasher=get_request_block_hasher(16, sha256),
+    )
+    assert scheduler.kv_cache_manager.get_computed_blocks(cached)[1] == 16
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():

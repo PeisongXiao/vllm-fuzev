@@ -10,11 +10,28 @@ import pytest
 from vllm import SamplingParams
 from vllm.config import VllmConfig
 from vllm.exceptions import VLLMValidationError
+from vllm.inputs.engine import TokensInput
 from vllm.v1.core.sched.utils import check_stop
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.request import Request, RequestStatus
 
 pytestmark = pytest.mark.skip_global_cleanup
+
+
+def test_fuzev_readout_can_consume_the_full_context_without_truncation():
+    processor = InputProcessor.__new__(InputProcessor)
+    processor.model_config = SimpleNamespace(max_model_len=32, runner_type="generate")
+    processor.renderer = SimpleNamespace(tokenizer=None)
+    processor.skip_prompt_length_check = False
+    processor.supports_mm_inputs = False
+    prompt: TokensInput = {"type": "token", "prompt_token_ids": [1] * 32}
+    processor._validate_model_inputs(None, prompt, reserve_output_token=False)
+    assert len(prompt["prompt_token_ids"]) == 32
+    with pytest.raises(VLLMValidationError, match="at least 1"):
+        processor._validate_model_inputs(None, prompt)
+    prompt["prompt_token_ids"].append(1)
+    with pytest.raises(VLLMValidationError, match="longer than"):
+        processor._validate_model_inputs(None, prompt, reserve_output_token=False)
 
 
 def _make_request(params: SamplingParams) -> Request:

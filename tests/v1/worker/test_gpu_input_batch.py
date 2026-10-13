@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
+from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.utils.torch_utils import make_tensor_with_pad
 from vllm.v1.pool.metadata import PoolingMetadata
@@ -24,6 +25,39 @@ MAX_PROMPT_SIZE = 100
 DEVICE_TYPE = current_platform.device_type
 DEVICES = [f"{DEVICE_TYPE}:{i}" for i in range(min(current_platform.device_count(), 2))]
 MAX_NUM_PROMPT_TOKENS = 64
+
+
+def test_fuzev_feature_metadata_is_removed_from_a_generation_batch(monkeypatch):
+    monkeypatch.setattr("vllm.v1.worker.gpu_input_batch.PIN_MEMORY", False)
+    batch = InputBatch(
+        max_num_reqs=2,
+        max_model_len=16,
+        max_num_batched_tokens=16,
+        device=torch.device("cpu"),
+        vocab_size=32,
+        block_sizes=[4],
+        kernel_block_sizes=[4],
+        max_num_blocks_per_req=[4],
+    )
+    request = CachedRequestState(
+        req_id="features",
+        prompt_token_ids=[1, 2],
+        mm_features=[],
+        sampling_params=None,
+        generator=None,
+        block_ids=([1],),
+        num_computed_tokens=0,
+        output_token_ids=[],
+        pooling_params=PoolingParams(task="fuzev_features"),
+    )
+    batch.add_request(request)
+    assert not batch.is_pooling_model
+    assert request.req_id in batch.pooling_params
+    batch.remove_request(request.req_id)
+    batch.condense()
+    assert batch.pooling_params == {}
+    assert batch.pooling_states == {}
+    assert batch.num_reqs == 0
 
 
 def _compare_objs(obj1, obj2, skip: Sequence = ("logitsprocs", "batch_update_builder")):

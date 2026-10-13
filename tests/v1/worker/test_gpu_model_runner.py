@@ -1415,6 +1415,7 @@ def test_input_batch_reinitialized_after_late_interleave_adjustment(monkeypatch)
     spec = SimpleNamespace(
         block_size=16,
         max_num_blocks_per_req=lambda *_: 4,
+        uses_slot_mapping=True,
     )
     kv_cache_config = SimpleNamespace(
         kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
@@ -1431,6 +1432,52 @@ def test_input_batch_reinitialized_after_late_interleave_adjustment(monkeypatch)
 
     assert input_batch_cls.call_count == 1
     assert input_batch_cls.call_args.kwargs["cp_kv_cache_interleave_size"] == 16
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_input_batch_circular_cache_avoids_generic_slot_mapping(monkeypatch, wrapped):
+    from vllm.v1.kv_cache_interface import CircularBufferSpec, UniformTypeKVCacheSpecs
+
+    runner = object.__new__(GPUModelRunner)
+    runner.vllm_config = SimpleNamespace(reasoning_config=None)
+    runner.parallel_config = SimpleNamespace(cp_kv_cache_interleave_size=1)
+    runner.cache_config = SimpleNamespace(use_replayssm=False)
+    runner.model_config = SimpleNamespace(get_vocab_size=lambda: 32)
+    runner.max_model_len = 262144
+    runner.max_encoder_len = 0
+    runner.max_num_reqs = 4
+    runner.max_num_tokens = 8192
+    runner.num_spec_tokens = 3
+    runner.device = torch.device("cpu")
+    runner.is_pooling_model = False
+    runner._init_block_sizes = [8]
+    runner._init_kernel_block_sizes = [8]
+    runner._init_max_num_blocks = [1]
+    runner._init_slot_mapping_modes = [
+        gpu_model_runner_module.SlotMappingMode.TOKEN_TO_KV_SLOT
+    ]
+    runner.cp_kv_cache_interleave_size = 1
+    runner.input_batch = SimpleNamespace(
+        logitsprocs=None, logitsprocs_need_output_token_ids=False
+    )
+    runner.jit_warmup_registry = Mock()
+    runner.jit_warmup_registry.activate.return_value = nullcontext()
+    spec = CircularBufferSpec(
+        block_size=8, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    if wrapped:
+        spec = UniformTypeKVCacheSpecs(block_size=8, kv_cache_specs={"raw": spec})
+    config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)])
+    input_batch_cls = Mock(return_value=SimpleNamespace())
+    monkeypatch.setattr(gpu_model_runner_module, "InputBatch", input_batch_cls)
+
+    runner.may_reinitialize_input_batch(config, [8])
+
+    assert input_batch_cls.call_count == 1
+    assert input_batch_cls.call_args.kwargs["slot_mapping_modes"] == [
+        gpu_model_runner_module.SlotMappingMode.NONE
+    ]
+    assert runner._init_max_num_blocks == [1]
 
 
 def test_v2_runner_snapshots_late_interleave_adjustment(monkeypatch):

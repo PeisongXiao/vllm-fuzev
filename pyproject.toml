@@ -16,8 +16,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vllm"
 authors = [{name = "vLLM Team"}]
+maintainers = [{ name = "Peisong Xiao" }]
 license = "Apache-2.0"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "NOTICE"]
 readme = "README.md"
 description = "A high-throughput and memory-efficient inference and serving engine for LLMs"
 classifiers = [

@@ -153,6 +153,7 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+from vllm.v1.fuzev import FEATURE_TASK, fuzev_enabled
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
@@ -204,6 +205,7 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
     update_ngram_gpu_tensors_incremental,
     update_scheduler_for_invalid_drafts,
 )
+from vllm.v1.spec_decode.qwen4 import Qwen4MTPProposer
 from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
@@ -505,6 +507,9 @@ class GPUModelRunner(
         device: torch.device,
     ):
         self.vllm_config = vllm_config
+        self.fuzev_enabled = fuzev_enabled(vllm_config)
+        self._fuzev_readout_batch = False
+        self._fuzev_paused_accepted_tokens: dict[str, int] = {}
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.offload_config = vllm_config.offload_config
@@ -673,6 +678,8 @@ class GPUModelRunner(
                 self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_step3p5_mtp():
                 self.drafter = Step3p5MTPProposer(self.vllm_config, self.device, self)
+            elif self.speculative_config.use_qwen4_mtp():
+                self.drafter = Qwen4MTPProposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
@@ -815,6 +822,9 @@ class GPUModelRunner(
         # [max_num_reqs, depth] prompt token ids preceding each request's chunk
         # start, for models exposing `token_lookback_depth`. Sized after load.
         self.lookback_token_ids: CpuGpuBuffer | None = None
+        self.qwen4_ngram_context: CpuGpuBuffer | None = None
+        self.qwen4_ple_query_start_loc: CpuGpuBuffer | None = None
+        self.qwen4_ngram_eos_token_id = 0
         self.positions = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=self.device
         )
@@ -1087,8 +1097,77 @@ class GPUModelRunner(
             buf.np[:num_reqs] = np.where(valid, ids, -1)
         return buf.copy_to_gpu()
 
+    def _init_qwen4_ple_buffers(self) -> None:
+        config = self.model_config.hf_text_config
+        if not (
+            any(name.startswith("Qwen4Exp") for name in self.model_config.architectures)
+            and getattr(config, "ple_layer_ids", None)
+        ):
+            return
+        if self.scheduler_config.async_scheduling:
+            raise NotImplementedError(
+                "Qwen4 PLE in the V1 GPU model runner uses synchronous scheduling; "
+                "set --no-async-scheduling"
+            )
+        depth = int(config.ngram_size) - 1
+        if depth <= 0:
+            raise ValueError("N-gram embedding requires context length >= 1")
+        self.qwen4_ngram_eos_token_id = int(config.eos_token_id)
+        self.qwen4_ngram_context = self._make_buffer(
+            self.max_num_reqs, depth, dtype=torch.int32
+        )
+        self.qwen4_ple_query_start_loc = self._make_buffer(
+            self.max_num_reqs + 1, dtype=torch.int32
+        )
+
+    def _prepare_qwen4_ple_kwargs(
+        self,
+        *,
+        num_scheduled_tokens: np.ndarray | None = None,
+        num_tokens: int | None = None,
+    ) -> dict[str, torch.Tensor]:
+        context = self.qwen4_ngram_context
+        query = self.qwen4_ple_query_start_loc
+        if context is None or query is None:
+            return {}
+        # Reuse the runner's pinned-buffer event protocol for both forward paths.
+        with self.synchronize_input_prep():
+            context.np.fill(self.qwen4_ngram_eos_token_id)
+            if num_scheduled_tokens is None:
+                num_reqs = self.input_batch.num_reqs
+                if num_reqs:
+                    starts = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                    offsets = np.arange(-context.np.shape[1], 0)
+                    positions = starts[:, None] + offsets
+                    rows = np.arange(num_reqs)[:, None]
+                    ids = self.input_batch.token_ids_cpu[
+                        rows, np.clip(positions, 0, None)
+                    ]
+                    context.np[:num_reqs] = np.where(
+                        positions >= 0, ids, self.qwen4_ngram_eos_token_id
+                    )
+                query.np[: num_reqs + 1] = self.query_start_loc.np[: num_reqs + 1]
+                end = int(query.np[num_reqs])
+            else:
+                counts = np.asarray(num_scheduled_tokens, dtype=np.int32)
+                num_reqs = len(counts)
+                query.np[0] = 0
+                np.cumsum(counts, out=query.np[1 : num_reqs + 1])
+                end = int(query.np[num_reqs])
+                if num_tokens is not None:
+                    end = num_tokens
+                    query.np[num_reqs] = end
+            query.np[num_reqs + 1 :].fill(end)
+            return {
+                "query_start_loc": query.copy_to_gpu(),
+                "ngram_context": context.copy_to_gpu(),
+            }
+
     def _init_model_kwargs(self, num_reqs: int | None = None):
         model_kwargs = dict[str, Any]()
+
+        if num_reqs is None:
+            model_kwargs.update(self._prepare_qwen4_ple_kwargs())
 
         if self.lookback_token_ids is not None:
             if num_reqs is None:
@@ -1222,6 +1301,8 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        if self.fuzev_enabled:
+            self._save_fuzev_paused_acceptance(scheduler_output)
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             req_state = self.requests.pop(req_id, None)
@@ -1528,7 +1609,11 @@ class GPUModelRunner(
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
         for request in reqs_to_add:
-            self.input_batch.add_request(request)
+            req_index = self.input_batch.add_request(request)
+            if self.fuzev_enabled:
+                accepted = self._fuzev_paused_accepted_tokens.pop(request.req_id, None)
+                if accepted is not None:
+                    self.input_batch.num_accepted_tokens_cpu[req_index] = accepted
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
 
         # Condense the batched states if there are gaps left by removed requests
@@ -1585,7 +1670,7 @@ class GPUModelRunner(
             return None
 
     def _update_states_after_model_execute(
-        self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
+        self, output_token_ids: torch.Tensor | None, scheduler_output: "SchedulerOutput"
     ) -> None:
         """Update the cached states after model execution.
 
@@ -1601,8 +1686,16 @@ class GPUModelRunner(
         # Count the number of accepted tokens for each sequence.
         # Valid tokens are contiguous from position 0, so counting non-(-1)
         # tokens gives us the first -1 position (i.e., number of accepted).
-        num_reqs = output_token_ids.size(0)
-        self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
+        if output_token_ids is None:
+            # No drafts: slot zero contains the committed target state. This is
+            # the state-copy convention, not a sampled token for the readout.
+            num_reqs = self.input_batch.num_reqs
+            self.num_accepted_tokens.gpu[:num_reqs].fill_(1)
+        else:
+            num_reqs = output_token_ids.size(0)
+            self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(
+                dim=1
+            )
 
         if self.cache_config.mamba_cache_mode == "align":
             # Fused GPU postprocess: state copies + per-request accepted-token
@@ -3368,6 +3461,8 @@ class GPUModelRunner(
 
         if self.model_config.runner_type == "generate":
             tasks.extend(self.get_supported_generation_tasks())
+            if self.fuzev_enabled:
+                tasks.append(FEATURE_TASK)
         if self.model_config.runner_type == "pooling":
             tasks.extend(self.get_supported_pooling_tasks())
 
@@ -3426,6 +3521,92 @@ class GPUModelRunner(
         self.eplb_state.update_mapping(
             self.model_config,
             expanded_physical_to_logical,
+        )
+
+    def _save_fuzev_paused_acceptance(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        if self._fuzev_paused_accepted_tokens:
+            reset = (
+                scheduler_output.finished_req_ids
+                | scheduler_output.scheduled_cached_reqs.resumed_req_ids
+            )
+            for req_id in reset:
+                self._fuzev_paused_accepted_tokens.pop(req_id, None)
+        if (
+            not scheduler_output.fuzev_readout_lane
+            or self.num_accepted_tokens_event is None
+        ):
+            return
+        reset = (
+            scheduler_output.finished_req_ids
+            | scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        )
+        paused = (
+            self.input_batch.req_id_to_index.keys()
+            - scheduler_output.num_scheduled_tokens.keys()
+            - reset
+        )
+        if paused:
+            # InputBatch re-addition defaults to slot zero. A generation lane
+            # paused for a readout must resume from its accepted state slot.
+            self.num_accepted_tokens_event.synchronize()
+            for req_id in paused:
+                index = self.input_batch.req_id_to_index[req_id]
+                self._fuzev_paused_accepted_tokens[req_id] = int(
+                    self.input_batch.num_accepted_tokens_cpu[index]
+                )
+
+    def _prepare_fuzev_readout(self, scheduler_output: "SchedulerOutput") -> bool:
+        return self.fuzev_enabled and bool(self.input_batch.pooling_params)
+
+    def _fuzev_readout(
+        self,
+        hidden_states: torch.Tensor,
+        kv_connector_output: KVConnectorOutput | None,
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        """Read features, optionally projecting query labels on the original LM."""
+        count = self.input_batch.num_reqs
+        params = self.input_batch.get_pooling_params()
+        last_positions = self.query_start_loc.gpu[1 : count + 1].long() - 1
+        features = hidden_states.index_select(0, last_positions).float()
+        prompt_lengths = torch.from_numpy(self.input_batch.num_prompt_tokens[:count])
+        finished = (self.optimistic_seq_lens_cpu[:count] >= prompt_lengths).tolist()
+        outputs = list(features.unbind())
+        rows, label_ids = [], []
+        for index, param in enumerate(params):
+            labels = (param.extra_kwargs or {}).get("baseline_token_ids")
+            if finished[index] and labels:
+                rows.append(index)
+                label_ids.append(labels)
+        if rows:
+            logits = self.model.compute_logits(hidden_states[last_positions[rows]])
+            if logits is not None:
+                lengths = [len(labels) for labels in label_ids]
+                indices = torch.tensor(
+                    [
+                        [row for row, labels in enumerate(label_ids) for _ in labels],
+                        [token for labels in label_ids for token in labels],
+                    ],
+                    device=logits.device,
+                )
+                scores = logits[indices[0], indices[1]].float().split(lengths)
+                for index, values in zip(rows, scores):
+                    outputs[index] = torch.cat((features[index], values))
+        output = ModelRunnerOutput(
+            req_ids=self.input_batch.req_ids.copy(),
+            req_id_to_index=self.input_batch.req_id_to_index.copy(),
+            kv_connector_output=kv_connector_output,
+        )
+        if not current_platform.is_cuda_alike():
+            output.pooler_output = _copy_pooler_output_to_cpu(outputs, finished)
+            self._sync_device()
+            return output
+        return AsyncGPUPoolingModelRunnerOutput(
+            model_runner_output=output,
+            raw_pooler_output=outputs,
+            finished_mask=finished,
+            async_output_copy_stream=self._get_or_create_async_output_copy_stream(),
         )
 
     def _pool(
@@ -3972,6 +4153,14 @@ class GPUModelRunner(
         torch.Tensor | None,
         CUDAGraphStat | None,
     ]:
+        if (
+            self._fuzev_readout_batch
+            and self.num_spec_tokens
+            and force_uniform_decode is None
+        ):
+            # K+1 exact prompt tokens are not a speculative decode batch.
+            # Keep mixed/piecewise graphs; do not replay a drafter-shaped graph.
+            force_uniform_decode = False
         uniform_decode = self._is_uniform_decode(
             max_num_scheduled_tokens=max_num_scheduled_tokens,
             uniform_decode_query_len=self.uniform_decode_query_len,
@@ -4224,6 +4413,7 @@ class GPUModelRunner(
         ):
             # Update persistent batch states.
             deferred_state_corrections_fn = self._update_states(scheduler_output)
+            self._fuzev_readout_batch = self._prepare_fuzev_readout(scheduler_output)
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -4434,7 +4624,9 @@ class GPUModelRunner(
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
-        defer_kv_connector_finalize = self.speculative_config is not None
+        defer_kv_connector_finalize = (
+            self.speculative_config is not None and not self._fuzev_readout_batch
+        )
         # Update the EPLB meta.
         if self.eplb_state is not None:
             self.eplb_state.prepare_forward(
@@ -4484,6 +4676,12 @@ class GPUModelRunner(
                     assert isinstance(hidden_states, IntermediateTensors)
                     self.kv_connector_output = kv_connector_output
                     return hidden_states
+
+                if self._fuzev_readout_batch:
+                    if deferred_state_corrections_fn is not None:
+                        deferred_state_corrections_fn()
+                    self._update_states_after_model_execute(None, scheduler_output)
+                    return self._fuzev_readout(hidden_states, kv_connector_output)
 
                 if self.is_pooling_model:
                     # Return the pooling output.
@@ -4896,7 +5094,11 @@ class GPUModelRunner(
         self.input_batch.prev_req_id_to_index = prev_req_id_to_index
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
-        if not self.num_spec_tokens or not self._draft_token_req_ids:
+        if (
+            self._fuzev_readout_batch
+            or not self.num_spec_tokens
+            or not self._draft_token_req_ids
+        ):
             return None
         draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
         return DraftTokenIds(req_ids, draft_token_ids)
@@ -5340,6 +5542,7 @@ class GPUModelRunner(
                     self.lookback_token_ids = self._make_buffer(
                         self.max_num_reqs, lookback_depth, dtype=torch.int32
                     )
+                self._init_qwen4_ple_buffers()
                 if self.lora_config:
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
@@ -6126,6 +6329,13 @@ class GPUModelRunner(
             else:
                 input_ids = self.input_ids.gpu[:num_tokens_padded]
                 inputs_embeds = None
+
+            model_kwargs.update(
+                self._prepare_qwen4_ple_kwargs(
+                    num_scheduled_tokens=num_scheduled_tokens,
+                    num_tokens=num_tokens_padded,
+                )
+            )
 
             if self.uses_mrope:
                 positions = self.mrope_positions.gpu[:, :num_tokens_padded]
@@ -7278,7 +7488,15 @@ class GPUModelRunner(
                 continue
             block_size = kv_cache_spec.block_size
             block_sizes.append(block_size)
-            if kv_cache_spec_kind == KVCacheSpecKind.MAMBA:
+            layer_spec = (
+                kv_cache_spec.first_spec
+                if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs)
+                else kv_cache_spec
+            )
+            if (
+                kv_cache_spec_kind == KVCacheSpecKind.MAMBA
+                or not layer_spec.uses_slot_mapping
+            ):
                 slot_mapping_modes.append(SlotMappingMode.NONE)
             else:
                 slot_mapping_modes.append(SlotMappingMode.TOKEN_TO_KV_SLOT)

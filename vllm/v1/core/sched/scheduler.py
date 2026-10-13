@@ -54,6 +54,7 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.fuzev import fuzev_enabled, is_feature_request, select_feature_batch
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
@@ -89,6 +90,9 @@ class Scheduler(SchedulerInterface):
         log_stats: bool = False,
     ) -> None:
         self.vllm_config = vllm_config
+        self.fuzev_enabled = fuzev_enabled(vllm_config)
+        self._fuzev_previous_lane = True
+        self._fuzev_active_requests = 0
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
@@ -553,6 +557,8 @@ class Scheduler(SchedulerInterface):
         Either finish the prefill or leave at least num_prefill_lookahead for
         the next chunk. No-op for eagle-family drafters (lookahead 1).
         """
+        if self.fuzev_enabled and is_feature_request(request):
+            return num_new_tokens
         remaining = request.num_tokens - num_computed_tokens - num_new_tokens
         if 0 < remaining < self.num_prefill_lookahead:
             num_new_tokens -= self.num_prefill_lookahead - remaining
@@ -560,6 +566,18 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        feature_lane = False
+        if self._fuzev_active_requests:
+            feature_lane = select_feature_batch(
+                self.running,
+                self.waiting.unordered(),
+                self.skipped_waiting.unordered(),
+                self.max_num_running_reqs
+                - len(self.running)
+                - self.num_waiting_for_streaming_input,
+                self._fuzev_previous_lane,
+            )
+        self._fuzev_previous_lane = feature_lane
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -579,8 +597,18 @@ class Scheduler(SchedulerInterface):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
-        spec = self.vllm_config.speculative_config
+        spec = None if feature_lane else self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
+        num_lookahead_tokens = 0 if feature_lane else self.num_lookahead_tokens
+        num_prefill_lookahead = 0 if feature_lane else self.num_prefill_lookahead
+        # A readout does not run the drafter, so it cannot publish a complete
+        # target/draft cache entry. Existing valid hits remain usable; generation
+        # still allocates and publishes through the unchanged upstream path.
+        defer_readout_cache = (
+            feature_lane
+            and self.vllm_config.speculative_config is not None
+            and self.vllm_config.speculative_config.uses_draft_kv_cache()
+        )
         input_budget = self.scheduler_config.max_num_batched_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
@@ -611,6 +639,9 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            if self.fuzev_enabled and is_feature_request(request) != feature_lane:
+                req_index += 1
+                continue
             if input_budget <= draft_slots:
                 break
 
@@ -670,7 +701,7 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens,
                 self.max_model_len
                 - request.num_computed_tokens
-                - self.num_sampled_tokens_per_step,
+                - (0 if request.pooling_params else self.num_sampled_tokens_per_step),
             )
 
             # Apply Mamba alignment before encoder caps.
@@ -694,7 +725,7 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens,
                     num_new_tokens,
                     encoder_compute_budget,
-                    shift_computed_tokens=self.num_prefill_lookahead,
+                    shift_computed_tokens=num_prefill_lookahead,
                 )
 
             # Multi-module MTP: avoid ending a prefill chunk within
@@ -729,7 +760,8 @@ class Scheduler(SchedulerInterface):
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
+                        num_lookahead_tokens=num_lookahead_tokens,
+                        delay_cache_blocks=defer_readout_cache,
                     )
 
                     if new_blocks is not None:
@@ -869,6 +901,10 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                if self.fuzev_enabled and is_feature_request(request) != feature_lane:
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -1043,7 +1079,10 @@ class Scheduler(SchedulerInterface):
                     # preserve full cudagraph for this step.
                     # Not for diffusion where draft tokens can't be padded.
                     if (
-                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
+                        not feature_lane
+                        and (
+                            self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None
+                        )
                         and self.num_sampled_tokens_per_step > 0
                         and num_new_tokens == 1
                         and not prefill_scheduled
@@ -1115,7 +1154,7 @@ class Scheduler(SchedulerInterface):
                             num_computed_tokens,
                             num_new_tokens,
                             encoder_compute_budget,
-                            shift_computed_tokens=self.num_prefill_lookahead,
+                            shift_computed_tokens=num_prefill_lookahead,
                         )
 
                     # Multi-module MTP: avoid ending a prefill chunk within
@@ -1131,9 +1170,9 @@ class Scheduler(SchedulerInterface):
                 # During async KV load, no forward pass is run yet.
                 # Allocate speculative lookahead slots later to avoid
                 # mismatching local and remote block counts.
-                limit_lookahead_tokens = load_kv_async and self.num_lookahead_tokens > 0
+                limit_lookahead_tokens = load_kv_async and num_lookahead_tokens > 0
                 effective_lookahead_tokens = (
-                    0 if limit_lookahead_tokens else self.num_lookahead_tokens
+                    0 if limit_lookahead_tokens else num_lookahead_tokens
                 )
 
                 # Determine if we need to allocate cross-attention blocks.
@@ -1163,7 +1202,7 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
                     num_external_computed_tokens=num_external_computed_tokens,
-                    delay_cache_blocks=load_kv_async,
+                    delay_cache_blocks=load_kv_async or defer_readout_cache,
                     num_encoder_tokens=num_encoder_tokens,
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     reserved_blocks=reserved_blocks,
@@ -1389,8 +1428,12 @@ class Scheduler(SchedulerInterface):
         pending_kv_cache_block_copies = kv_cache_block_copies or None
 
         # Dynamic speculative decoding: compute optimal K
-        num_spec_tokens_to_schedule = self.num_spec_tokens
-        if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
+        num_spec_tokens_to_schedule = 0 if feature_lane else self.num_spec_tokens
+        if (
+            not feature_lane
+            and self.dynamic_sd_lookup is not None
+            and len(num_scheduled_tokens) > 0
+        ):
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
@@ -1405,6 +1448,7 @@ class Scheduler(SchedulerInterface):
             )
 
         scheduler_output = SchedulerOutput(
+            fuzev_readout_lane=feature_lane,
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
             num_scheduled_tokens=num_scheduled_tokens,
@@ -2374,7 +2418,11 @@ class Scheduler(SchedulerInterface):
         # Defer the free by the drafter's look-ahead so an entry stays
         # referenced until the drafter's read-ahead has also passed it,
         # mirroring the shift the encoder scheduling path applies.
-        spec_lookahead = self.num_prefill_lookahead
+        spec_lookahead = (
+            0
+            if self.fuzev_enabled and is_feature_request(request)
+            else self.num_prefill_lookahead
+        )
 
         # Here, we use list(set) to avoid modifying the set while iterating
         # over it.
@@ -2411,7 +2459,9 @@ class Scheduler(SchedulerInterface):
                 # The request may have been finished. Skip.
                 continue
 
-            if request.is_prefill_chunk:
+            if request.is_prefill_chunk or (
+                self.fuzev_enabled and is_feature_request(request)
+            ):
                 # Ignore draft tokens for prefill chunks.
                 if request.spec_token_ids:
                     request.spec_token_ids = []
@@ -2435,6 +2485,11 @@ class Scheduler(SchedulerInterface):
             request = self.requests.get(req_id)
             if request is None or request.is_finished():
                 # The request may have been finished. Skip.
+                continue
+
+            if self.fuzev_enabled and is_feature_request(request):
+                request.spec_token_ids = []
+                sched_spec_tokens.pop(req_id, None)
                 continue
 
             placeholder_spec_tokens = sched_spec_tokens.get(req_id)
@@ -2486,6 +2541,8 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            if self.fuzev_enabled and is_feature_request(request):
+                self._fuzev_active_requests += 1
             if self.spec_decode_metrics_level != "none":
                 request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
                     self.num_spec_tokens
@@ -2563,6 +2620,8 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
 
+        if self.fuzev_enabled and is_feature_request(request):
+            self._fuzev_active_requests -= 1
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 

@@ -337,7 +337,11 @@ class InputProcessor:
         current_platform.validate_request(engine_input, params)
 
         encoder_input, decoder_input = split_enc_dec_input(engine_input)
-        self._validate_model_inputs(encoder_input, decoder_input)
+        self._validate_model_inputs(
+            encoder_input,
+            decoder_input,
+            reserve_output_token=isinstance(params, SamplingParams),
+        )
 
         # Mypy can be conservative for TypedDict unions; normalize access.
         if decoder_input["type"] == "embeds":
@@ -441,6 +445,8 @@ class InputProcessor:
         self,
         prompt_len: int,
         prompt_type: Literal["encoder", "decoder"],
+        *,
+        reserve_output_token: bool = True,
     ):
         if self.skip_prompt_length_check and prompt_type == "encoder":
             return
@@ -473,7 +479,11 @@ class InputProcessor:
                 f"longer than the maximum model length of {max_prompt_len}. "
                 f"{suggestion}"
             )
-        elif prompt_len == max_prompt_len and model_config.runner_type == "generate":
+        elif (
+            prompt_len == max_prompt_len
+            and model_config.runner_type == "generate"
+            and reserve_output_token
+        ):
             suggestion = (
                 "Make sure that `max_model_len` is no smaller than the "
                 "number of text tokens (prompt + requested output tokens)."
@@ -488,6 +498,8 @@ class InputProcessor:
         self,
         prompt_input: SingletonInput,
         prompt_type: Literal["encoder", "decoder"],
+        *,
+        reserve_output_token: bool = True,
     ) -> None:
         model_config = self.model_config
         tokenizer = self.tokenizer
@@ -502,7 +514,9 @@ class InputProcessor:
         )
 
         prompt_len = length_from_prompt_token_ids_or_embeds(prompt_ids, prompt_embeds)
-        self._validate_prompt_len(prompt_len, prompt_type)
+        self._validate_prompt_len(
+            prompt_len, prompt_type, reserve_output_token=reserve_output_token
+        )
 
         if prompt_input["type"] == "multimodal":
             decoder_mm_positions = prompt_input["mm_placeholders"]
@@ -552,8 +566,18 @@ class InputProcessor:
         self,
         encoder_input: SingletonInput | None,
         decoder_input: SingletonInput,
+        *,
+        reserve_output_token: bool = True,
     ):
         if encoder_input is not None:
-            self._validate_model_input(encoder_input, prompt_type="encoder")
+            self._validate_model_input(
+                encoder_input,
+                prompt_type="encoder",
+                reserve_output_token=reserve_output_token,
+            )
 
-        self._validate_model_input(decoder_input, prompt_type="decoder")
+        self._validate_model_input(
+            decoder_input,
+            prompt_type="decoder",
+            reserve_output_token=reserve_output_token,
+        )

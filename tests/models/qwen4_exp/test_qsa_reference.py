@@ -924,6 +924,7 @@ def test_qsa_block_expansion_correctness() -> None:
         pytest.param(2048, 24, 2, 1600, False, 63, id="tp1_r2048_uniform"),
     ],
 )
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_qsa_sparse_paged_attention_correctness(
     num_rows: int,
     num_query_heads: int,
@@ -931,6 +932,7 @@ def test_qsa_sparse_paged_attention_correctness(
     page_size: int,
     use_prefill_config: bool,
     num_requests: int,
+    cache_dtype: torch.dtype,
 ) -> None:
     torch.manual_seed(2)
     head_dim = 256
@@ -954,6 +956,13 @@ def test_qsa_sparse_paged_attention_correctness(
         dtype=torch.bfloat16,
     )
     k_cache, v_cache = kv_cache.split(head_dim, dim=-1)
+    k_scale = v_scale = None
+    if cache_dtype == torch.float8_e4m3fn:
+        k_scale, v_scale = (torch.rand(2) * 0.2 + 0.1).tolist()
+        k_cache = (k_cache.float() / k_scale).to(cache_dtype)
+        v_cache = (v_cache.float() / v_scale).to(cache_dtype)
+    reference_k = k_cache.float() * (k_scale if k_scale is not None else 1.0)
+    reference_v = v_cache.float() * (v_scale if v_scale is not None else 1.0)
     block_table = (
         torch.randperm(num_cache_blocks, device="cuda")
         .reshape(num_requests, num_pages_per_request)
@@ -1024,12 +1033,14 @@ def test_qsa_sparse_paged_attention_correctness(
         block_table,
         token_to_req,
         use_prefill_config=use_prefill_config,
+        k_scale=k_scale,
+        v_scale=v_scale,
         output_gate=output_gate,
     )
     expected = _qsa_sparse_paged_attention_reference(
         q,
-        k_cache,
-        v_cache,
+        reference_k,
+        reference_v,
         logical_indices[:, :selection_width],
         block_table,
         token_to_req,

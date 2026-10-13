@@ -22,6 +22,33 @@ SCHEDULER_BLOCK_SIZE = 256
 KERNEL_BLOCK_SIZE = 64
 
 
+def test_qwen4_mtp_uses_image_token_id(monkeypatch: pytest.MonkeyPatch):
+    language_model = object()
+    target = SimpleNamespace(
+        config=SimpleNamespace(image_token_id=12345),
+        get_language_model=lambda: language_model,
+    )
+    draft = SimpleNamespace(config=SimpleNamespace())
+    shared = []
+    proposer = SimpleNamespace(
+        vllm_config=None,
+        _get_model=lambda: draft,
+        supports_mm_inputs=False,
+        get_model_name=lambda model: "Qwen4ExpForConditionalGeneration",
+        _maybe_share_embeddings=lambda model: shared.append(model),
+        _maybe_share_lm_head=lambda model: shared.append(model),
+        parallel_drafting=False,
+    )
+    monkeypatch.setattr(
+        llm_base_proposer, "get_layers_from_vllm_config", lambda *a, **k: {}
+    )
+    monkeypatch.setattr(llm_base_proposer, "supports_multimodal", lambda model: True)
+    llm_base_proposer.SpecDecodeBaseProposer.load_model(proposer, target)
+    assert proposer.model is draft
+    assert draft.config.image_token_index == target.config.image_token_id
+    assert shared == [language_model, language_model]
+
+
 class _FakeAttentionGroup:
     def __init__(self, backend, layer_names, kv_cache_spec, kv_cache_group_id):
         self.backend = backend

@@ -553,7 +553,7 @@ class InputBatch:
                 del self.lora_id_to_lora_request[lora_id]
             self.request_lora_mapping[req_index] = 0
 
-        if self.is_pooling_model:
+        if self.is_pooling_model or req_id in self.pooling_params:
             self.pooling_params.pop(req_id, None)
             self.pooling_states.pop(req_id, None)
             return req_index

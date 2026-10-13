@@ -3,8 +3,11 @@
 """Inference-only Qwen4Exp model."""
 
 from collections.abc import Iterable
+from copy import copy
 from itertools import islice
+from typing import Any, cast
 
+import regex as re
 import torch
 from torch import nn
 
@@ -90,6 +93,35 @@ def without_modelopt_fp4(
     if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
         return None
     return quant_config
+
+
+def _qwen4_exl3_vision_quant_config(
+    quant_config: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    if quant_config is None or quant_config.get_name() != "exl3":
+        return quant_config
+    layers = cast(Any, quant_config).non_routed_exl3.get("layers", {})
+    if not any(name.endswith(".attn.qkv_proj") for name in layers):
+        return quant_config
+    # Split packs name QKV's spec qkv_proj; the vision module is qkv.
+    vision_config = copy(quant_config)
+    exl3_config = cast(Any, vision_config)
+    non_routed = dict(exl3_config.non_routed_exl3)
+    layers = dict(non_routed.get("layers", {}))
+    for name, spec in list(layers.items()):
+        if name.endswith(".attn.qkv_proj"):
+            layers.setdefault(name.removesuffix("_proj"), dict(spec))
+    exl3_config.non_routed_exl3 = {**non_routed, "layers": layers}
+    return vision_config
+
+
+_EXL3_VISION_WEIGHTS_MAPPER = WeightsMapper(
+    # Drop only the stale fused counterparts, before mapping the packed biases.
+    orig_to_new_regex={re.compile(r"(?:^|\.)attn\.qkv\.(?:weight|bias)$"): None},
+    orig_to_new_stacked={
+        f"attn.{part}_proj.": ("attn.qkv.", part) for part in ("q", "k", "v")
+    },
+)
 
 
 def _remap_qsa_cache_scale_name(
@@ -671,9 +703,16 @@ class Qwen4ExpForCausalLM(
         self.model = Qwen4ExpModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        # Packed EXL3 checkpoints also quantize the existing LM projection.
+        head_quant_config = (
+            self.quant_config
+            if self.quant_config is not None and self.quant_config.get_name() == "exl3"
+            else None
+        )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
+            quant_config=head_quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
@@ -920,12 +959,15 @@ class Qwen4ExpForConditionalGeneration(
             self._tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
 
             with self._mark_tower_model(vllm_config, {"image", "video"}):
+                vision_quant_config = _qwen4_exl3_vision_quant_config(quant_config)
                 self.visual = Qwen3_VisionTransformer(
                     config.vision_config,
                     norm_eps=config.text_config.rms_norm_eps,
-                    quant_config=quant_config,
+                    quant_config=vision_quant_config,
                     prefix=maybe_prefix(prefix, "visual"),
                 )
+                if vision_quant_config is not quant_config:
+                    self.visual.hf_to_vllm_mapper |= _EXL3_VISION_WEIGHTS_MAPPER
 
         self.use_deepstack = (
             not self.language_model_only

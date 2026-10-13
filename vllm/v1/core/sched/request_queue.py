@@ -66,6 +66,10 @@ class RequestQueue(ABC):
         """Get number of requests in queue."""
         pass
 
+    def unordered(self) -> Iterator[Request]:
+        """Iterate without applying priority ordering."""
+        return iter(self)
+
     @abstractmethod
     def __iter__(self) -> Iterator[Request]:
         """Iterate over the queue according to the policy."""
@@ -190,6 +194,9 @@ class PriorityRequestQueue(RequestQueue):
     def __len__(self) -> int:
         """Get number of requests in queue."""
         return len(self._heap)
+
+    def unordered(self) -> Iterator[Request]:
+        return iter(self._heap)
 
     def __iter__(self) -> Iterator[Request]:
         """Iterate over the queue according to priority policy."""

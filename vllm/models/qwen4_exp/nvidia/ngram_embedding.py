@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Qwen4Exp n-gram embeddings with device and pinned-host storage."""
 
+import ctypes
+import mmap
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from typing import ClassVar
@@ -18,6 +21,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors import (
+    compressed_tensors,
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.modelopt import (
@@ -41,12 +47,38 @@ from vllm.transformers_utils.configs.qwen4_exp import (
 )
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_uva_available
-from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+from vllm.utils.torch_utils import (
+    direct_register_custom_op,
+    get_accelerator_view_from_cpu_tensor,
+)
 
 from ..common.ple import PLEVocabParallelEmbedding
 from .ops.ple import ple_ngram_ids
 
 logger = init_logger(__name__)
+PLE_MMAP_LOOKUP_OP = "vllm::qwen4_exp_ple_mmap_lookup_out"
+
+
+@eager_break_during_capture(materialize=True)
+def _ple_mmap_lookup_out(
+    ngram_ids: torch.Tensor, output: torch.Tensor, layer_name: str
+) -> None:
+    layer = get_forward_context().no_compile_layers[layer_name]
+    output.copy_(layer._gather_mapped_rows(ngram_ids))
+
+
+def _ple_mmap_lookup_fake(
+    ngram_ids: torch.Tensor, output: torch.Tensor, layer_name: str
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_ple_mmap_lookup_out",
+    op_func=_ple_mmap_lookup_out,
+    mutates_args=["output"],
+    fake_impl=_ple_mmap_lookup_fake,
+)
 
 
 class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
@@ -161,8 +193,12 @@ class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
 class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
     """Quantization interface shared by resident and pinned PLE tables."""
 
-    # PLE post-load processing only validates scales in their current storage.
+    # Post-load work preserves each table's existing storage.
     requires_device_loading: bool = False
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        if isinstance(layer, Qwen4ExpPLEMmapEmbedding):
+            layer.finalize_mappings()
 
     @staticmethod
     def from_quant_config(
@@ -171,10 +207,20 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
         embedding_dtype: str | None = None,
     ) -> "Qwen4ExpPLEEmbeddingMethod":
         """Select the concrete PLE embedding format for a layer."""
+        factory = getattr(quant_config, "get_ple_embedding_method", None)
+        if factory is not None:
+            method = factory(prefix, embedding_dtype)
+            if method is not None:
+                return method
         if embedding_dtype == "float8_e4m3fn":
             return Qwen4ExpPLEFp8EmbeddingMethod()
         if quant_config is None:
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+        if isinstance(quant_config, compressed_tensors.CompressedTensorsConfig):
+            # Mixed checkpoints may quantize the transformer but leave PLE raw.
+            scheme = quant_config.get_scheme_dict(nn.Embedding(0, 0), prefix)
+            if scheme is None or scheme.get("weights") is None:
+                return Qwen4ExpPLEUnquantizedEmbeddingMethod()
         if isinstance(quant_config, ModelOptMixedPrecisionConfig):
             if quant_config._resolve_quant_algo(prefix) == "FP8":
                 return Qwen4ExpPLEFp8EmbeddingMethod()
@@ -304,6 +350,7 @@ class Qwen4ExpPLEFp8EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         """Reject FP8 PLE checkpoints without a global scale."""
+        super().process_weights_after_loading(layer)
         sentinel = torch.finfo(torch.float32).min
         if torch.any(layer.weight_scale == sentinel):
             raise ValueError("FP8 PLE checkpoint is missing its global scale")
@@ -352,6 +399,120 @@ class Qwen4ExpPLEDeviceEmbedding(Qwen4ExpPLEEmbedding):
             ngram_ids.shape[0],
             slot_offset,
         )
+
+
+class Qwen4ExpPLEMmapEmbedding(Qwen4ExpPLEDeviceEmbedding):
+    """Rank-local file lookup, outside piecewise CUDA graph capture."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        config = get_current_vllm_config()
+        self._graph_boundary = not config.model_config.enforce_eager
+        self._layer_name = kwargs["prefix"]
+        if not isinstance(
+            kwargs["embedding_method"],
+            (Qwen4ExpPLEUnquantizedEmbeddingMethod, Qwen4ExpPLEFp8EmbeddingMethod),
+        ):
+            raise ValueError(
+                'ple_storage="mmap" supports raw BF16/FP8 PLE tables; '
+                "packed tables use their quantization plugin's storage"
+            )
+        self._mapped_shards: dict[int, torch.Tensor] = {}
+        super().__init__(*args, **kwargs)
+        if self._graph_boundary:
+            context = config.compilation_config.static_forward_context
+            if self._layer_name in context:
+                raise ValueError(f"Duplicate mmap PLE layer: {self._layer_name}")
+            context[self._layer_name] = self
+
+    def allocate_embedding_weight(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        del num_embeddings
+        return torch.empty(1, embedding_dim, dtype=dtype, device="cpu")
+
+    def weight_loader(
+        self,
+        param: torch.Tensor,
+        loaded_weight: torch.Tensor,
+        checkpoint_start: int | None = None,
+    ) -> None:
+        if param is not self.weight:
+            super().weight_loader(param, loaded_weight)
+            return
+        if checkpoint_start is None:
+            checkpoint_start = 0
+        self._mapped_shards[checkpoint_start] = loaded_weight.detach()
+
+    @staticmethod
+    def _advise_random_access(first: int, last: int) -> None:
+        # Hashed row gathers are random; disable read-ahead over the table.
+        lower = first // mmap.PAGESIZE * mmap.PAGESIZE
+        upper = (last + mmap.PAGESIZE - 1) // mmap.PAGESIZE * mmap.PAGESIZE
+        madvise = ctypes.CDLL(None, use_errno=True).madvise
+        madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+        madvise.restype = ctypes.c_int
+        if madvise(lower, upper - lower, mmap.MADV_RANDOM) != 0:
+            errno = ctypes.get_errno()
+            logger.warning_once(
+                "PLE mmap random-access advice failed: %s", os.strerror(errno)
+            )
+
+    def finalize_mappings(self) -> None:
+        position = 0
+        for start, tensor in sorted(self._mapped_shards.items()):
+            if start != position:
+                raise ValueError("Mmap PLE shards have a gap or overlap")
+            position += tensor.shape[0]
+        if position != self.org_vocab_size:
+            raise ValueError("Mmap PLE checkpoint is incomplete")
+        for tensor in self._mapped_shards.values():
+            first = tensor.data_ptr()
+            self._advise_random_access(
+                first, first + tensor.numel() * tensor.element_size()
+            )
+        self._tables = [table for _, table in sorted(self._mapped_shards.items())]
+        self._shard_starts = torch.tensor(sorted(self._mapped_shards), dtype=torch.long)
+
+    def _gather_mapped_rows(self, ngram_ids: torch.Tensor) -> torch.Tensor:
+        ids, inverse = torch.unique(
+            ngram_ids.detach().reshape(-1).to(device="cpu", dtype=torch.long),
+            sorted=True,
+            return_inverse=True,
+        )
+        rows = torch.empty(
+            ids.numel(), self.embedding_dim, dtype=self.weight.dtype, device="cpu"
+        )
+        raw_rows = rows.view(torch.uint8)
+        shard_ids, counts = torch.unique_consecutive(
+            torch.bucketize(ids, self._shard_starts[1:], right=True), return_counts=True
+        )
+        offset = 0
+        for shard, count in zip(shard_ids.tolist(), counts.tolist()):
+            end = offset + count
+            raw_rows[offset:end] = (
+                self._tables[shard]
+                .view(torch.uint8)
+                .index_select(0, ids[offset:end] - self._shard_starts[shard])
+            )
+            offset = end
+        output = raw_rows.index_select(0, inverse).view(self.weight.dtype)
+        return output.reshape(*ngram_ids.shape, self.embedding_dim)
+
+    def forward(self, ngram_ids: torch.Tensor) -> torch.Tensor:
+        if not self._graph_boundary:
+            return self._gather_mapped_rows(ngram_ids).to(device=ngram_ids.device)
+        output = torch.empty(
+            (*ngram_ids.shape, self.embedding_dim),
+            dtype=self.weight.dtype,
+            device=ngram_ids.device,
+        )
+        torch.ops.vllm.qwen4_exp_ple_mmap_lookup_out(
+            ngram_ids, output, self._layer_name
+        )
+        return output
 
 
 @triton.jit
@@ -699,12 +860,23 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
-        engram_config = get_current_vllm_config().engram_config
+        vllm_config = get_current_vllm_config()
+        engram_config = vllm_config.engram_config
+        additional = (
+            vllm_config.additional_config
+            if isinstance(vllm_config.additional_config, dict)
+            else {}
+        )
+        storage = additional.get("ple_storage", "resident")
+        if storage not in {"resident", "mmap"}:
+            raise ValueError("Unknown PLE storage policy")
         embedding_cls = (
             Qwen4ExpPLEPinnedHostEmbedding
             if engram_config is not None and engram_config.cpu_offload
             else Qwen4ExpPLEDeviceEmbedding
         )
+        if storage == "mmap":
+            embedding_cls = Qwen4ExpPLEMmapEmbedding
         self.ngram_embedding = embedding_cls(
             padded_vocab_size,
             self.head_dim,
@@ -716,15 +888,15 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             max_total_tokens=max_total_tokens,
             data_parallel_rank=data_parallel_rank,
         )
-        weight = self.ngram_embedding.weight
+        weight = getattr(self.ngram_embedding, "weight", None)
         logger.info(
             "Initialized PLE embedding %s: quantization_method=%s, "
             "weight_dtype=%s, weight_device=%s, pinned=%s",
             embedding_prefix,
             type(embedding_quant_method).__name__,
-            weight.dtype,
-            weight.device,
-            weight.is_pinned(),
+            weight.dtype if weight is not None else "method-defined",
+            weight.device if weight is not None else "method-defined",
+            weight.is_pinned() if weight is not None else None,
         )
 
     @staticmethod

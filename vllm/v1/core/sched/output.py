@@ -258,6 +258,9 @@ class SchedulerOutput:
     # freed from the encoder cache.
     free_encoder_mm_hashes: list[str]
 
+    # Accepted hybrid state is saved only when a decision pauses generation.
+    fuzev_readout_lane: bool = False
+
     scheduled_encoder_input_stats: ScheduledEncoderInputStats | None = None
 
     # Request IDs that are preempted in this step.
